@@ -32,7 +32,7 @@ private:
   void callbackImu(const sensor_msgs::Imu::ConstPtr& imu);
 
   void publishPose(const ros::TimerEvent& e);
-
+  void publishCompTime();
   void publishToROS(pcl::PointCloud<PointType>::ConstPtr published_cloud, Eigen::Matrix4f T_cloud);
   void publishCloud(pcl::PointCloud<PointType>::ConstPtr published_cloud, Eigen::Matrix4f T_cloud);
   void publishKeyframe(std::pair<std::pair<Eigen::Vector3f, Eigen::Quaternionf>,
@@ -96,6 +96,7 @@ private:
   ros::Publisher kf_pose_pub;
   ros::Publisher kf_cloud_pub;
   ros::Publisher deskewed_pub;
+  ros::Publisher comp_time_pub;
 
   // ROS Msgs
   nav_msgs::Odometry odom_ros;
@@ -181,6 +182,10 @@ private:
   std::vector<double> imu_rates;
   std::vector<double> lidar_rates;
 
+  double avg_comp_time;
+  double total_time =0;
+  int total_frame=0;
+  
   double first_scan_stamp;
   double elapsed_time;
 

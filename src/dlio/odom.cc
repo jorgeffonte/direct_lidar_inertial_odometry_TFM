@@ -28,9 +28,10 @@ dlio::OdomNode::OdomNode(ros::NodeHandle node_handle) : nh(node_handle) {
 
   this->lidar_sub = this->nh.subscribe("pointcloud", 1,
       &dlio::OdomNode::callbackPointCloud, this, ros::TransportHints().tcpNoDelay());
-  this->imu_sub = this->nh.subscribe("imu", 1000,
+  this->imu_sub = this->nh.subscribe("imu", 10,
       &dlio::OdomNode::callbackImu, this, ros::TransportHints().tcpNoDelay());
-
+  this->comp_time_pub = this->nh.advertise<std_msgs::Float64>("/comp_time", 1);
+  
   this->odom_pub     = this->nh.advertise<nav_msgs::Odometry>("odom", 1, true);
   this->pose_pub     = this->nh.advertise<geometry_msgs::PoseStamped>("pose", 1, true);
   this->path_pub     = this->nh.advertise<nav_msgs::Path>("path", 1, true);
@@ -161,6 +162,18 @@ dlio::OdomNode::OdomNode(ros::NodeHandle node_handle) : nh(node_handle) {
 }
 
 dlio::OdomNode::~OdomNode() {}
+
+
+/**
+ * Publish Pose
+ **/
+
+void dlio::OdomNode::publishCompTime() {
+  std_msgs::Float64 time_msg;
+  time_msg.data = this->comp_times.back()*1000;
+  this->comp_time_pub.publish(time_msg);
+
+}
 
 void dlio::OdomNode::getParams() {
 
@@ -360,6 +373,7 @@ void dlio::OdomNode::publishPose(const ros::TimerEvent& e) {
 
 void dlio::OdomNode::publishToROS(pcl::PointCloud<PointType>::ConstPtr published_cloud, Eigen::Matrix4f T_cloud) {
   this->publishCloud(published_cloud, T_cloud);
+  this->publishCompTime();
 
   // nav_msgs::Path
   this->path_ros.header.stamp = this->imu_stamp;
@@ -532,53 +546,63 @@ void dlio::OdomNode::getScanFromROS(const sensor_msgs::PointCloud2ConstPtr& pc) 
 }
 
 void dlio::OdomNode::preprocessPoints() {
+  // Capturar el tiempo inicial
+  auto start = std::chrono::high_resolution_clock::now();
 
   // Deskew the original dlio-type scan
   if (this->deskew_) {
-
+    auto t1 = std::chrono::high_resolution_clock::now();
+    
     this->deskewPointcloud();
+    
+    auto t2 = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> duration1 = t2 - t1;
+    // ROS_INFO("Time for deskewPointcloud: %f seconds", duration1.count());
 
     if (!this->first_valid_scan) {
       return;
     }
 
   } else {
+    auto t3 = std::chrono::high_resolution_clock::now();
 
     this->scan_stamp = this->scan_header_stamp.toSec();
 
     // don't process scans until IMU data is present
     if (!this->first_valid_scan) {
-
       if (this->imu_buffer.empty() || this->scan_stamp <= this->imu_buffer.back().stamp) {
         return;
       }
 
       this->first_valid_scan = true;
       this->T_prior = this->T; // assume no motion for the first scan
-
     } else {
-
       // IMU prior for second scan onwards
-    std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>> frames;
+      std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>> frames;
       frames = this->integrateImu(this->prev_scan_stamp, this->lidarPose.q, this->lidarPose.p,
-                                this->geo.prev_vel.cast<float>(), {this->scan_stamp});
+                                  this->geo.prev_vel.cast<float>(), {this->scan_stamp});
 
-    if (frames.size() > 0) {
-      this->T_prior = frames.back();
-    } else {
-      this->T_prior = this->T;
-    }
-
+      if (frames.size() > 0) {
+        this->T_prior = frames.back();
+      } else {
+        this->T_prior = this->T;
+      }
     }
 
     pcl::PointCloud<PointType>::Ptr deskewed_scan_ (boost::make_shared<pcl::PointCloud<PointType>>());
-    pcl::transformPointCloud (*this->original_scan, *deskewed_scan_,
-                              this->T_prior * this->extrinsics.baselink2lidar_T);
+    pcl::transformPointCloud(*this->original_scan, *deskewed_scan_,
+                             this->T_prior * this->extrinsics.baselink2lidar_T);
     this->deskewed_scan = deskewed_scan_;
     this->deskew_status = false;
+
+    auto t4 = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> duration2 = t4 - t3;
+    // ROS_INFO("Time for non-deskew preprocessing: %f seconds", duration2.count());
   }
 
   // Voxel Grid Filter
+  auto t5 = std::chrono::high_resolution_clock::now();
+
   if (this->vf_use_) {
     pcl::PointCloud<PointType>::Ptr current_scan_
       (boost::make_shared<pcl::PointCloud<PointType>>(*this->deskewed_scan));
@@ -589,15 +613,26 @@ void dlio::OdomNode::preprocessPoints() {
     this->current_scan = this->deskewed_scan;
   }
 
-}
+  auto t6 = std::chrono::high_resolution_clock::now();
+  std::chrono::duration<double> duration3 = t6 - t5;
+  // ROS_INFO("Time for Voxel Grid Filter: %f seconds", duration3.count());
 
+  // Capturar el tiempo final
+  auto end = std::chrono::high_resolution_clock::now();
+  std::chrono::duration<double> total_duration = end - start;
+  // ROS_INFO("Total time for preprocessPoints: %f seconds", total_duration.count());
+}
 void dlio::OdomNode::deskewPointcloud() {
+  // Capturar el tiempo inicial
+  auto start = std::chrono::high_resolution_clock::now();
 
   pcl::PointCloud<PointType>::Ptr deskewed_scan_ (boost::make_shared<pcl::PointCloud<PointType>>());
   deskewed_scan_->points.resize(this->original_scan->points.size());
 
   // individual point timestamps should be relative to this time
   double sweep_ref_time = this->scan_header_stamp.toSec();
+
+  auto t1 = std::chrono::high_resolution_clock::now();
 
   // sort points by timestamp and build list of timestamps
   std::function<bool(const PointType&, const PointType&)> point_time_cmp;
@@ -606,48 +641,38 @@ void dlio::OdomNode::deskewPointcloud() {
   std::function<double(boost::range::index_value<PointType&, long>)> extract_point_time;
 
   if (this->sensor == dlio::SensorType::OUSTER) {
-
-    point_time_cmp = [](const PointType& p1, const PointType& p2)
-      { return p1.t < p2.t; };
+    point_time_cmp = [](const PointType& p1, const PointType& p2) { return p1.t < p2.t; };
     point_time_neq = [](boost::range::index_value<PointType&, long> p1,
-                        boost::range::index_value<PointType&, long> p2)
-      { return p1.value().t != p2.value().t; };
-    extract_point_time = [&sweep_ref_time](boost::range::index_value<PointType&, long> pt)
-      { return sweep_ref_time + pt.value().t * 1e-9f; };
-
+                        boost::range::index_value<PointType&, long> p2) { return p1.value().t != p2.value().t; };
+    extract_point_time = [&sweep_ref_time](boost::range::index_value<PointType&, long> pt) { return sweep_ref_time + pt.value().t * 1e-9f; };
   } else if (this->sensor == dlio::SensorType::VELODYNE) {
-
-    point_time_cmp = [](const PointType& p1, const PointType& p2)
-      { return p1.time < p2.time; };
+    point_time_cmp = [](const PointType& p1, const PointType& p2) { return p1.time < p2.time; };
     point_time_neq = [](boost::range::index_value<PointType&, long> p1,
-                        boost::range::index_value<PointType&, long> p2)
-      { return p1.value().time != p2.value().time; };
-    extract_point_time = [&sweep_ref_time](boost::range::index_value<PointType&, long> pt)
-      { return sweep_ref_time + pt.value().time; };
-
+                        boost::range::index_value<PointType&, long> p2) { return p1.value().time != p2.value().time; };
+    extract_point_time = [&sweep_ref_time](boost::range::index_value<PointType&, long> pt) { return sweep_ref_time + pt.value().time; };
   } else if (this->sensor == dlio::SensorType::HESAI) {
-
-    point_time_cmp = [](const PointType& p1, const PointType& p2)
-      { return p1.timestamp < p2.timestamp; };
+    point_time_cmp = [](const PointType& p1, const PointType& p2) { return p1.timestamp < p2.timestamp; };
     point_time_neq = [](boost::range::index_value<PointType&, long> p1,
-                        boost::range::index_value<PointType&, long> p2)
-      { return p1.value().timestamp != p2.value().timestamp; };
-    extract_point_time = [&sweep_ref_time](boost::range::index_value<PointType&, long> pt)
-      { return pt.value().timestamp; };
-
+                        boost::range::index_value<PointType&, long> p2) { return p1.value().timestamp != p2.value().timestamp; };
+    extract_point_time = [&sweep_ref_time](boost::range::index_value<PointType&, long> pt) { return pt.value().timestamp; };
   } else if (this->sensor == dlio::SensorType::LIVOX) {
-    point_time_cmp = [](const PointType& p1, const PointType& p2)
-      { return p1.timestamp < p2.timestamp; };
+    point_time_cmp = [](const PointType& p1, const PointType& p2) { return p1.timestamp < p2.timestamp; };
     point_time_neq = [](boost::range::index_value<PointType&, long> p1,
-                        boost::range::index_value<PointType&, long> p2)
-      { return p1.value().timestamp != p2.value().timestamp; };
-    extract_point_time = [&sweep_ref_time](boost::range::index_value<PointType&, long> pt)
-      { return pt.value().timestamp * 1e-9f; };
+                        boost::range::index_value<PointType&, long> p2) { return p1.value().timestamp != p2.value().timestamp; };
+    extract_point_time = [&sweep_ref_time](boost::range::index_value<PointType&, long> pt) { return pt.value().timestamp * 1e-9f; };
   }
+
+  auto t2 = std::chrono::high_resolution_clock::now();
+  std::chrono::duration<double, std::milli> duration1 = t2 - t1;
+  // ROS_INFO("Time for setting up functions: %f ms", duration1.count());
 
   // copy points into deskewed_scan_ in order of timestamp
   std::partial_sort_copy(this->original_scan->points.begin(), this->original_scan->points.end(),
                          deskewed_scan_->points.begin(), deskewed_scan_->points.end(), point_time_cmp);
+
+  auto t3 = std::chrono::high_resolution_clock::now();
+  std::chrono::duration<double, std::milli> duration2 = t3 - t2;
+  // ROS_INFO("Time for partial sort copy: %f ms", duration2.count());
 
   // filter unique timestamps
   auto points_unique_timestamps = deskewed_scan_->points
@@ -659,7 +684,7 @@ void dlio::OdomNode::deskewPointcloud() {
   std::vector<int> unique_time_indices;
 
   // compute offset between sweep reference time and first point timestamp
-  double offset = 0.0;
+  double offset = -0.1; // TODO JORGE: -0.1 ntu 0.0 kitti
   if (this->time_offset_) {
     offset = sweep_ref_time - extract_point_time(*points_unique_timestamps.begin());
   }
@@ -673,6 +698,10 @@ void dlio::OdomNode::deskewPointcloud() {
 
   int median_pt_index = timestamps.size() / 2;
   this->scan_stamp = timestamps[median_pt_index]; // set this->scan_stamp to the timestamp of the median point
+
+  auto t4 = std::chrono::high_resolution_clock::now();
+  std::chrono::duration<double, std::milli> duration3 = t4 - t3;
+  // ROS_INFO("Time for extracting timestamps: %f ms", duration3.count());
 
   // don't process scans until IMU data is present
   if (!this->first_valid_scan) {
@@ -694,6 +723,10 @@ void dlio::OdomNode::deskewPointcloud() {
                               this->geo.prev_vel.cast<float>(), timestamps);
   this->deskew_size = frames.size(); // if integration successful, equal to timestamps.size()
 
+  auto t5 = std::chrono::high_resolution_clock::now();
+  std::chrono::duration<double, std::milli> duration4 = t5 - t4;
+  // ROS_INFO("Time for integrating IMU: %f ms", duration4.count());
+
   // if there are no frames between the start and end of the sweep
   // that probably means that there's a sync issue
   if (frames.size() != timestamps.size()) {
@@ -709,22 +742,33 @@ void dlio::OdomNode::deskewPointcloud() {
   // update prior to be the estimated pose at the median time of the scan (corresponds to this->scan_stamp)
   this->T_prior = frames[median_pt_index];
 
+  auto t6 = std::chrono::high_resolution_clock::now();
+  std::chrono::duration<double, std::milli> duration5 = t6 - t5;
+  // ROS_INFO("Time for updating T_prior: %f ms", duration5.count());
+
 #pragma omp parallel for num_threads(this->num_threads_)
   for (int i = 0; i < timestamps.size(); i++) {
-
     Eigen::Matrix4f T = frames[i] * this->extrinsics.baselink2lidar_T;
 
     // transform point to world frame
-    for (int k = unique_time_indices[i]; k < unique_time_indices[i+1]; k++) {
+    for (int k = unique_time_indices[i]; k < unique_time_indices[i + 1]; k++) {
       auto &pt = deskewed_scan_->points[k];
       pt.getVector4fMap()[3] = 1.;
       pt.getVector4fMap() = T * pt.getVector4fMap();
     }
   }
 
+  auto t7 = std::chrono::high_resolution_clock::now();
+  std::chrono::duration<double, std::milli> duration6 = t7 - t6;
+  // ROS_INFO("Time for parallel transformation: %f ms", duration6.count());
+
   this->deskewed_scan = deskewed_scan_;
   this->deskew_status = true;
 
+  // Capturar el tiempo final
+  auto end = std::chrono::high_resolution_clock::now();
+  std::chrono::duration<double, std::milli> total_duration = end - start;
+  // ROS_INFO("Total time for deskewPointcloud: %f ms", total_duration.count());
 }
 
 void dlio::OdomNode::initializeInputTarget() {
@@ -763,7 +807,9 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::PointCloud2ConstPtr& 
   lock.unlock();
 
   double then = ros::Time::now().toSec();
-
+  std::chrono::time_point<std::chrono::system_clock> start, end;
+  start = std::chrono::system_clock::now();
+  
   if (this->first_scan_stamp == 0.) {
     this->first_scan_stamp = pc->header.stamp.toSec();
   }
@@ -773,11 +819,17 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::PointCloud2ConstPtr& 
     this->initializeDLIO();
   }
 
+  auto t1 = std::chrono::high_resolution_clock::now();
+
   // Convert incoming scan into DLIO format
   this->getScanFromROS(pc);
 
+  auto t2 = std::chrono::high_resolution_clock::now();
+
   // Preprocess points
   this->preprocessPoints();
+
+  auto t3 = std::chrono::high_resolution_clock::now();
 
   if (!this->first_valid_scan) {
     return;
@@ -789,38 +841,50 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::PointCloud2ConstPtr& 
   }
 
   // Compute Metrics
-  this->metrics_thread = std::thread( &dlio::OdomNode::computeMetrics, this );
+  this->metrics_thread = std::thread(&dlio::OdomNode::computeMetrics, this);
   this->metrics_thread.detach();
+
+  auto t4 = std::chrono::high_resolution_clock::now();
 
   // Set Adaptive Parameters
   if (this->adaptive_params_) {
     this->setAdaptiveParams();
   }
 
+  auto t5 = std::chrono::high_resolution_clock::now();
+
   // Set new frame as input source
   this->setInputSource();
+
+  auto t6 = std::chrono::high_resolution_clock::now();
 
   // Set initial frame as first keyframe
   if (this->keyframes.size() == 0) {
     this->initializeInputTarget();
     this->main_loop_running = false;
-    this->submap_future =
-      std::async( std::launch::async, &dlio::OdomNode::buildKeyframesAndSubmap, this, this->state );
+    this->submap_future = std::async(std::launch::async, &dlio::OdomNode::buildKeyframesAndSubmap, this, this->state);
     this->submap_future.wait(); // wait until completion
     return;
   }
 
+  auto t7 = std::chrono::high_resolution_clock::now();
+
   // Get the next pose via IMU + S2M + GEO
   this->getNextPose();
+
+  auto t8 = std::chrono::high_resolution_clock::now();
 
   // Update current keyframe poses and map
   this->updateKeyframes();
 
+  auto t9 = std::chrono::high_resolution_clock::now();
+
   // Build keyframe normals and submap if needed (and if we're not already waiting)
   if (this->new_submap_is_ready) {
-    this->main_loop_running = false;
-    this->submap_future =
-      std::async( std::launch::async, &dlio::OdomNode::buildKeyframesAndSubmap, this, this->state );
+      lock.lock();
+      this->main_loop_running = false;
+      lock.unlock();
+      this->submap_future = std::async(std::launch::async, &dlio::OdomNode::buildKeyframesAndSubmap, this, this->state);
   } else {
     lock.lock();
     this->main_loop_running = false;
@@ -828,6 +892,28 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::PointCloud2ConstPtr& 
     this->submap_build_cv.notify_one();
   }
 
+  auto t10 = std::chrono::high_resolution_clock::now();
+
+  // Print detailed timing information
+  std::chrono::duration<double> duration1 = t2 - t1;
+  std::chrono::duration<double> duration2 = t3 - t2;
+  std::chrono::duration<double> duration3 = t4 - t3;
+  std::chrono::duration<double> duration4 = t5 - t4;
+  std::chrono::duration<double> duration5 = t6 - t5;
+  std::chrono::duration<double> duration6 = t7 - t6;
+  std::chrono::duration<double> duration7 = t8 - t7;
+  std::chrono::duration<double> duration8 = t9 - t8;
+  std::chrono::duration<double> duration9 = t10 - t9;
+
+  // ROS_INFO("Time for getScanFromROS: %f seconds", duration1.count()*1000);
+  // ROS_INFO("Time for preprocessPoints: %f seconds", duration2.count()*1000);
+  // ROS_INFO("Time for metrics computation: %f seconds", duration3.count()*1000);
+  // ROS_INFO("Time for setting adaptive params: %f seconds", duration4.count()*1000);
+  // ROS_INFO("Time for setInputSource: %f seconds", duration5.count()*1000);
+  // ROS_INFO("Time for initializeInputTarget (if needed): %f seconds", duration6.count()*1000);
+  // ROS_INFO("Time for getNextPose: %f seconds", duration7.count()*1000);
+  // ROS_INFO("Time for updateKeyframes: %f seconds", duration8.count()*1000);
+  // ROS_INFO("Time for build keyframe normals and submap: %f seconds", duration9.count()*1000);
   // Update trajectory
   this->trajectory.push_back( std::make_pair(this->state.p, this->state.q) );
 
@@ -847,7 +933,14 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::PointCloud2ConstPtr& 
   this->publish_thread.detach();
 
   // Update some statistics
-  this->comp_times.push_back(ros::Time::now().toSec() - then);
+    end = std::chrono::system_clock::now();
+  std::chrono::duration<float> elapsed_seconds = end - start;
+  this->total_frame++;
+  float time_temp = elapsed_seconds.count() * 1000;
+  this->total_time += time_temp;
+  // ROS_INFO("average odom estimation time %f ms \n \n", this->total_time / this->total_frame);
+
+  this->comp_times.push_back(time_temp/1000);
   this->gicp_hasConverged = this->gicp.hasConverged();
 
   // Debug statements and publish custom DLIO message
@@ -1006,8 +1099,22 @@ void dlio::OdomNode::callbackImu(const sensor_msgs::Imu::ConstPtr& imu_raw) {
 void dlio::OdomNode::getNextPose() {
 
   // Check if the new submap is ready to be used
-  this->new_submap_is_ready = (this->submap_future.wait_for(std::chrono::seconds(0)) == std::future_status::ready);
+ // Capturar el tiempo antes de la comprobación
+    auto start = std::chrono::high_resolution_clock::now();
+    
+    // Verificar si el submapa asíncrono ha terminado de construirse
+    this->new_submap_is_ready = (this->submap_future.wait_for(std::chrono::seconds(0)) == std::future_status::ready);
+    
+    // Capturar el tiempo después de la comprobación
+    auto end = std::chrono::high_resolution_clock::now();
 
+    // Calcular la duración
+    std::chrono::duration<double> elapsed = end - start;
+
+    // Printear la duración
+    // ROS_INFO("Tiempo para comprobar new_submap_is_ready: %f segundos", elapsed.count());
+
+  
   if (this->new_submap_is_ready && this->submap_hasChanged) {
 
     // Set the current global submap as the target cloud
@@ -1043,11 +1150,25 @@ bool dlio::OdomNode::imuMeasFromTimeRange(double start_time, double end_time,
                                           boost::circular_buffer<ImuMeas>::reverse_iterator& begin_imu_it,
                                           boost::circular_buffer<ImuMeas>::reverse_iterator& end_imu_it) {
 
+  auto start = std::chrono::high_resolution_clock::now();
+
   if (this->imu_buffer.empty() || this->imu_buffer.front().stamp < end_time) {
-    // Wait for the latest IMU data
+    // Espera los últimos datos de IMU
+    auto wait_start = std::chrono::high_resolution_clock::now();
+    
     std::unique_lock<decltype(this->mtx_imu)> lock(this->mtx_imu);
-    this->cv_imu_stamp.wait(lock, [this, &end_time]{ return this->imu_buffer.front().stamp >= end_time; });
+    ROS_INFO("Waiting for IMU data: current buffer size = %lu, end_time = %f, imu_buffer.front().stamp = %f",
+             this->imu_buffer.size(), end_time, this->imu_buffer.empty() ? -1.0 : this->imu_buffer.front().stamp);
+    this->cv_imu_stamp.wait(lock, [this, &end_time]{ return !this->imu_buffer.empty() && this->imu_buffer.front().stamp >= end_time; });
+    
+    ROS_INFO("Waited for IMU data: current buffer size = %lu, end_time = %f, imu_buffer.front().stamp = %f",
+             this->imu_buffer.size(), end_time, this->imu_buffer.empty() ? -1.0 : this->imu_buffer.front().stamp);
+    auto wait_end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> wait_duration = wait_end - wait_start;
+    ROS_INFO("Time waiting for IMU data: %f ms", wait_duration.count());
   }
+
+  auto search_start = std::chrono::high_resolution_clock::now();
 
   auto imu_it = this->imu_buffer.begin();
 
@@ -1063,21 +1184,33 @@ bool dlio::OdomNode::imuMeasFromTimeRange(double start_time, double end_time,
   }
 
   if (imu_it == this->imu_buffer.end()) {
-    // not enough IMU measurements, return false
+    // No hay suficientes mediciones de IMU, retornar falso
     return false;
   }
   imu_it++;
 
-  // Set reverse iterators (to iterate forward in time)
+  auto search_end = std::chrono::high_resolution_clock::now();
+  std::chrono::duration<double, std::milli> search_duration = search_end - search_start;
+
+  // Configurar iteradores inversos (para iterar hacia adelante en el tiempo)
   end_imu_it = boost::circular_buffer<ImuMeas>::reverse_iterator(last_imu_it);
   begin_imu_it = boost::circular_buffer<ImuMeas>::reverse_iterator(imu_it);
+
+  auto end = std::chrono::high_resolution_clock::now();
+  std::chrono::duration<double, std::milli> total_duration = end - start;
+
+  // ROS_INFO("Time for searching IMU data: %f ms", search_duration.count());
+  // ROS_INFO("Total time for imuMeasFromTimeRange: %f ms", total_duration.count());
 
   return true;
 }
 
-std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>>
-dlio::OdomNode::integrateImu(double start_time, Eigen::Quaternionf q_init, Eigen::Vector3f p_init,
-                             Eigen::Vector3f v_init, const std::vector<double>& sorted_timestamps) {
+
+std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>> dlio::OdomNode::integrateImu(
+    double start_time, Eigen::Quaternionf q_init, Eigen::Vector3f p_init,
+    Eigen::Vector3f v_init, const std::vector<double>& sorted_timestamps) {
+
+  auto start = std::chrono::high_resolution_clock::now();
 
   const std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>> empty;
 
@@ -1093,9 +1226,13 @@ dlio::OdomNode::integrateImu(double start_time, Eigen::Quaternionf q_init, Eigen
     return empty;
   }
 
+  auto t1 = std::chrono::high_resolution_clock::now();
+  std::chrono::duration<double, std::milli> duration0 = t1 - start;
+  // ROS_INFO("Time for getting IMU measurements: %f ms", duration0.count());
+
   // Backwards integration to find pose at first IMU sample
   const ImuMeas& f1 = *begin_imu_it;
-  const ImuMeas& f2 = *(begin_imu_it+1);
+  const ImuMeas& f2 = *(begin_imu_it + 1);
 
   // Time between first two IMU samples
   double dt = f2.dt;
@@ -1108,27 +1245,29 @@ dlio::OdomNode::integrateImu(double start_time, Eigen::Quaternionf q_init, Eigen
   Eigen::Vector3f alpha = alpha_dt / dt;
 
   // Average angular velocity (reversed) between first IMU sample and start_time
-  Eigen::Vector3f omega_i = -(f1.ang_vel + 0.5*alpha*idt);
+  Eigen::Vector3f omega_i = -(f1.ang_vel + 0.5 * alpha * idt);
 
   // Set q_init to orientation at first IMU sample
-  q_init = Eigen::Quaternionf (
-    q_init.w() - 0.5*( q_init.x()*omega_i[0] + q_init.y()*omega_i[1] + q_init.z()*omega_i[2] ) * idt,
-    q_init.x() + 0.5*( q_init.w()*omega_i[0] - q_init.z()*omega_i[1] + q_init.y()*omega_i[2] ) * idt,
-    q_init.y() + 0.5*( q_init.z()*omega_i[0] + q_init.w()*omega_i[1] - q_init.x()*omega_i[2] ) * idt,
-    q_init.z() + 0.5*( q_init.x()*omega_i[1] - q_init.y()*omega_i[0] + q_init.w()*omega_i[2] ) * idt
-  );
+  q_init = Eigen::Quaternionf(
+      q_init.w() - 0.5 * (q_init.x() * omega_i[0] + q_init.y() * omega_i[1] + q_init.z() * omega_i[2]) * idt,
+      q_init.x() + 0.5 * (q_init.w() * omega_i[0] - q_init.z() * omega_i[1] + q_init.y() * omega_i[2]) * idt,
+      q_init.y() + 0.5 * (q_init.z() * omega_i[0] + q_init.w() * omega_i[1] - q_init.x() * omega_i[2]) * idt,
+      q_init.z() + 0.5 * (q_init.x() * omega_i[1] - q_init.y() * omega_i[0] + q_init.w() * omega_i[2]) * idt);
   q_init.normalize();
 
+  auto t2 = std::chrono::high_resolution_clock::now();
+  std::chrono::duration<double, std::milli> duration1 = t2 - t1;
+  // ROS_INFO("Time for backward integration: %f ms", duration1.count());
+
   // Average angular velocity between first two IMU samples
-  Eigen::Vector3f omega = f1.ang_vel + 0.5*alpha_dt;
+  Eigen::Vector3f omega = f1.ang_vel + 0.5 * alpha_dt;
 
   // Orientation at second IMU sample
-  Eigen::Quaternionf q2 (
-    q_init.w() - 0.5*( q_init.x()*omega[0] + q_init.y()*omega[1] + q_init.z()*omega[2] ) * dt,
-    q_init.x() + 0.5*( q_init.w()*omega[0] - q_init.z()*omega[1] + q_init.y()*omega[2] ) * dt,
-    q_init.y() + 0.5*( q_init.z()*omega[0] + q_init.w()*omega[1] - q_init.x()*omega[2] ) * dt,
-    q_init.z() + 0.5*( q_init.x()*omega[1] - q_init.y()*omega[0] + q_init.w()*omega[2] ) * dt
-  );
+  Eigen::Quaternionf q2(
+      q_init.w() - 0.5 * (q_init.x() * omega[0] + q_init.y() * omega[1] + q_init.z() * omega[2]) * dt,
+      q_init.x() + 0.5 * (q_init.w() * omega[0] - q_init.z() * omega[1] + q_init.y() * omega[2]) * dt,
+      q_init.y() + 0.5 * (q_init.z() * omega[0] + q_init.w() * omega[1] - q_init.x() * omega[2]) * dt,
+      q_init.z() + 0.5 * (q_init.x() * omega[1] - q_init.y() * omega[0] + q_init.w() * omega[2]) * dt);
   q2.normalize();
 
   // Acceleration at first IMU sample
@@ -1143,19 +1282,32 @@ dlio::OdomNode::integrateImu(double start_time, Eigen::Quaternionf q_init, Eigen
   Eigen::Vector3f j = (a2 - a1) / dt;
 
   // Set v_init to velocity at first IMU sample (go backwards from start_time)
-  v_init -= a1*idt + 0.5*j*idt*idt;
+  v_init -= a1 * idt + 0.5 * j * idt * idt;
 
   // Set p_init to position at first IMU sample (go backwards from start_time)
-  p_init -= v_init*idt + 0.5*a1*idt*idt + (1/6.)*j*idt*idt*idt;
+  p_init -= v_init * idt + 0.5 * a1 * idt * idt + (1 / 6.) * j * idt * idt * idt;
 
-  return this->integrateImuInternal(q_init, p_init, v_init, sorted_timestamps, begin_imu_it, end_imu_it);
+  auto t3 = std::chrono::high_resolution_clock::now();
+  std::chrono::duration<double, std::milli> duration2 = t3 - t2;
+  // ROS_INFO("Time for calculating initial values: %f ms", duration2.count());
+
+  auto imu_se3 = this->integrateImuInternal(q_init, p_init, v_init, sorted_timestamps, begin_imu_it, end_imu_it);
+
+  auto end = std::chrono::high_resolution_clock::now();
+  std::chrono::duration<double, std::milli> total_duration = end - start;
+  // ROS_INFO("Total time for integrateImu: %f ms", total_duration.count());
+
+  return imu_se3;
 }
 
-std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>>
-dlio::OdomNode::integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f p_init, Eigen::Vector3f v_init,
-                                     const std::vector<double>& sorted_timestamps,
-                                     boost::circular_buffer<ImuMeas>::reverse_iterator begin_imu_it,
-                                     boost::circular_buffer<ImuMeas>::reverse_iterator end_imu_it) {
+
+std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>> dlio::OdomNode::integrateImuInternal(
+    Eigen::Quaternionf q_init, Eigen::Vector3f p_init, Eigen::Vector3f v_init,
+    const std::vector<double>& sorted_timestamps,
+    boost::circular_buffer<ImuMeas>::reverse_iterator begin_imu_it,
+    boost::circular_buffer<ImuMeas>::reverse_iterator end_imu_it) {
+
+  auto start = std::chrono::high_resolution_clock::now();
 
   std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>> imu_se3;
 
@@ -1166,13 +1318,19 @@ dlio::OdomNode::integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f 
   Eigen::Vector3f a = q._transformVector(begin_imu_it->lin_accel);
   a[2] -= this->gravity_;
 
+  auto t1 = std::chrono::high_resolution_clock::now();
+  std::chrono::duration<double, std::milli> init_duration = t1 - start;
+
   // Iterate over IMU measurements and timestamps
   auto prev_imu_it = begin_imu_it;
   auto imu_it = prev_imu_it + 1;
 
   auto stamp_it = sorted_timestamps.begin();
 
+  std::chrono::duration<double, std::milli> loop_duration(0);
+
   for (; imu_it != end_imu_it; imu_it++) {
+    auto loop_start = std::chrono::high_resolution_clock::now();
 
     const ImuMeas& f0 = *prev_imu_it;
     const ImuMeas& f = *imu_it;
@@ -1185,15 +1343,14 @@ dlio::OdomNode::integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f 
     Eigen::Vector3f alpha = alpha_dt / dt;
 
     // Average angular velocity
-    Eigen::Vector3f omega = f0.ang_vel + 0.5*alpha_dt;
+    Eigen::Vector3f omega = f0.ang_vel + 0.5 * alpha_dt;
 
     // Orientation
-    q = Eigen::Quaternionf (
-      q.w() - 0.5*( q.x()*omega[0] + q.y()*omega[1] + q.z()*omega[2] ) * dt,
-      q.x() + 0.5*( q.w()*omega[0] - q.z()*omega[1] + q.y()*omega[2] ) * dt,
-      q.y() + 0.5*( q.z()*omega[0] + q.w()*omega[1] - q.x()*omega[2] ) * dt,
-      q.z() + 0.5*( q.x()*omega[1] - q.y()*omega[0] + q.w()*omega[2] ) * dt
-    );
+    q = Eigen::Quaternionf(
+        q.w() - 0.5 * (q.x() * omega[0] + q.y() * omega[1] + q.z() * omega[2]) * dt,
+        q.x() + 0.5 * (q.w() * omega[0] - q.z() * omega[1] + q.y() * omega[2]) * dt,
+        q.y() + 0.5 * (q.z() * omega[0] + q.w() * omega[1] - q.x() * omega[2]) * dt,
+        q.z() + 0.5 * (q.x() * omega[1] - q.y() * omega[0] + q.w() * omega[2]) * dt);
     q.normalize();
 
     // Acceleration
@@ -1211,19 +1368,18 @@ dlio::OdomNode::integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f 
       double idt = *stamp_it - f0.stamp;
 
       // Average angular velocity
-      Eigen::Vector3f omega_i = f0.ang_vel + 0.5*alpha*idt;
+      Eigen::Vector3f omega_i = f0.ang_vel + 0.5 * alpha * idt;
 
       // Orientation
-      Eigen::Quaternionf q_i (
-        q.w() - 0.5*( q.x()*omega_i[0] + q.y()*omega_i[1] + q.z()*omega_i[2] ) * idt,
-        q.x() + 0.5*( q.w()*omega_i[0] - q.z()*omega_i[1] + q.y()*omega_i[2] ) * idt,
-        q.y() + 0.5*( q.z()*omega_i[0] + q.w()*omega_i[1] - q.x()*omega_i[2] ) * idt,
-        q.z() + 0.5*( q.x()*omega_i[1] - q.y()*omega_i[0] + q.w()*omega_i[2] ) * idt
-      );
+      Eigen::Quaternionf q_i(
+          q.w() - 0.5 * (q.x() * omega_i[0] + q.y() * omega_i[1] + q.z() * omega_i[2]) * idt,
+          q.x() + 0.5 * (q.w() * omega_i[0] - q.z() * omega_i[1] + q.y() * omega_i[2]) * idt,
+          q.y() + 0.5 * (q.z() * omega_i[0] + q.w() * omega_i[1] - q.x() * omega_i[2]) * idt,
+          q.z() + 0.5 * (q.x() * omega_i[1] - q.y() * omega_i[0] + q.w() * omega_i[2]) * idt);
       q_i.normalize();
 
       // Position
-      Eigen::Vector3f p_i = p + v*idt + 0.5*a0*idt*idt + (1/6.)*j*idt*idt*idt;
+      Eigen::Vector3f p_i = p + v * idt + 0.5 * a0 * idt * idt + (1 / 6.) * j * idt * idt * idt;
 
       // Transformation
       Eigen::Matrix4f T = Eigen::Matrix4f::Identity();
@@ -1236,17 +1392,25 @@ dlio::OdomNode::integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f 
     }
 
     // Position
-    p += v*dt + 0.5*a0*dt*dt + (1/6.)*j_dt*dt*dt;
+    p += v * dt + 0.5 * a0 * dt * dt + (1 / 6.) * j_dt * dt * dt;
 
     // Velocity
-    v += a0*dt + 0.5*j_dt*dt;
+    v += a0 * dt + 0.5 * j_dt * dt;
 
     prev_imu_it = imu_it;
 
+    auto loop_end = std::chrono::high_resolution_clock::now();
+    loop_duration += loop_end - loop_start;
   }
 
-  return imu_se3;
+  auto end = std::chrono::high_resolution_clock::now();
+  std::chrono::duration<double, std::milli> duration = end - start;
 
+  // ROS_INFO("Initialization time: %f ms", init_duration.count());
+  // ROS_INFO("Loop time for integrateImuInternal: %f ms", loop_duration.count());
+  // ROS_INFO("Total time for integrateImuInternal: %f ms", duration.count());
+
+  return imu_se3;
 }
 
 void dlio::OdomNode::propagateGICP() {
@@ -2010,6 +2174,11 @@ void dlio::OdomNode::debug() {
   std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
     << "RAM Allocation   :: " + to_string_with_precision(resident_set/1000., 2) + " MB"
     << "|" << std::endl;
+  
+  std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
+    << "Keyframes size   :: " + std::to_string(this->keyframes.size()) + " keyframes"
+    << "|" << std::endl;
+
 
   std::cout << "+-------------------------------------------------------------------+" << std::endl;
 

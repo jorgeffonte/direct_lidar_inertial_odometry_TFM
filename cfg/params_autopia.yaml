@@ -15,15 +15,15 @@ dlio:
   frames:
     odom: odom
     baselink: base_link
-    lidar: lidar
-    imu: imu
+    lidar: rubyplus
+    imu: imu_link
 
   map:
-    waitUntilMove: true
+    waitUntilMove: false
     dense:
-      filtered: false
+      filtered: true
     sparse:
-      leafSize: 0.25
+      leafSize: 1.0
 
   odom:
 
@@ -42,10 +42,10 @@ dlio:
       cropBoxFilter:
         size: 1.0
       voxelFilter:
-        res: 0.5
+        res: 1.0
 
     keyframe:
-      threshD: 1.0
+      threshD: 10.0
       threshR: 45.0
 
     submap:

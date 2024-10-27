@@ -49,6 +49,7 @@ std::string to_string_with_precision(const T a_value, const int n = 6)
 #include <geometry_msgs/PoseStamped.h>
 #include <geometry_msgs/PoseArray.h>
 #include <nav_msgs/Path.h>
+#include <std_msgs/Float64.h>
 #include <sensor_msgs/Imu.h>
 #include <sensor_msgs/PointCloud2.h>
 #include <tf2_ros/transform_broadcaster.h>
@@ -91,7 +92,7 @@ namespace dlio {
     union {
     std::uint32_t t;   // (Ouster) time since beginning of scan in nanoseconds
     float time;        // (Velodyne) time since beginning of scan in seconds
-    double timestamp;  // (Hesai) absolute timestamp in seconds
+    double timestamp;  // (Hesai or ROBOSENSE) absolute timestamp in seconds 
                        // (Livox) absolute timestamp in (seconds * 10e9)
     };
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
